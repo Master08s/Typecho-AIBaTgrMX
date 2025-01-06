@@ -279,9 +279,7 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
             'features',
             array(
                 'summary' => _t('自动生成文章摘要'),
-                'tags' => _t('自动生成标签'),
-                'category' => _t('分类推荐'),
-                'seo' => _t('SEO优化')
+                'tags' => _t('自动生成标签')
             ),
             array('summary'),
             _t('启用功能'),
@@ -369,7 +367,7 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
         $form->addInput($tagsPrompt);
 
         // 分类推荐提示词
-        $categoryPrompt = new Typecho_Widget_Helper_Form_Element_Textarea(
+      /*  $categoryPrompt = new Typecho_Widget_Helper_Form_Element_Textarea(
             'categoryPrompt',
             NULL,
             self::getDefaultCategoryPrompt(),
@@ -386,7 +384,7 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
             _t('SEO优化提示词'),
             _t('用于生成SEO信息的系统提示词，支持变量：{{LANGUAGE}}、{{SEO_LENGTH}}')
         );
-        $form->addInput($seoPrompt);
+        $form->addInput($seoPrompt);*/
 
         // 添加配置面板的样式和脚本
         echo '<style>
@@ -514,11 +512,51 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
 
             // 如果没有启用任何功能，直接返回
             if (empty($features)) {
+                error_log('AIBaTgrMX: No features enabled');
                 return $contents;
             }
 
             // 获取文章文本
             $text = $contents['text'];
+            error_log('AIBaTgrMX: Processing content length: ' . strlen($text));
+
+            // 分类推荐
+            if (in_array('category', $features)) {
+                error_log('AIBaTgrMX: Category feature is enabled');
+                // 只在没有设置分类或分类为空时进行推荐
+                if (empty($contents['category']) || $contents['category'] == '0') {
+                    error_log('AIBaTgrMX: No category set, attempting to suggest one');
+                    try {
+                        $categoryMid = self::suggestCategory($text);
+                        error_log('AIBaTgrMX: Suggested category mid: ' . $categoryMid);
+                        
+                        if (!empty($categoryMid) && is_numeric($categoryMid)) {
+                            // 验证分类是否存在
+                            $db = Typecho_Db::get();
+                            $category = $db->fetchRow($db->select('mid')
+                                ->from('table.metas')
+                                ->where('type = ?', 'category')
+                                ->where('mid = ?', $categoryMid));
+                            
+                            if ($category) {
+                                error_log('AIBaTgrMX: Setting category mid to: ' . $categoryMid);
+                                $contents['category'] = strval($categoryMid);
+                                $contents['categories'] = array($categoryMid);
+                            } else {
+                                error_log('AIBaTgrMX: Category mid not found: ' . $categoryMid);
+                            }
+                        } else {
+                            error_log('AIBaTgrMX: Invalid category mid returned: ' . $categoryMid);
+                        }
+                    } catch (Exception $e) {
+                        error_log('AIBaTgrMX: Error suggesting category: ' . $e->getMessage());
+                    }
+                } else {
+                    error_log('AIBaTgrMX: Category already set to: ' . $contents['category']);
+                }
+            } else {
+                error_log('AIBaTgrMX: Category feature is not enabled');
+            }
 
             // 生成标签
             if (in_array('tags', $features)) {
@@ -530,6 +568,7 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
                     } else {
                         $contents['tags'] = $tags;
                     }
+                    error_log('AIBaTgrMX: Generated tags: ' . $tags);
                 }
             }
 
@@ -538,14 +577,7 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
                 $summary = self::generateSummary($text);
                 if (!empty($summary)) {
                     $contents['excerpt'] = $summary;
-                }
-            }
-
-            // 分类推荐
-            if (in_array('category', $features) && empty($contents['category'])) {
-                $category = self::suggestCategory($text);
-                if (!empty($category)) {
-                    $contents['category'] = $category;
+                    error_log('AIBaTgrMX: Generated summary length: ' . strlen($summary));
                 }
             }
 
@@ -619,38 +651,275 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
      * 推荐分类
      * 
      * @param string $content 文章内容
-     * @return string 推荐的分类mid
+     * @return string|null 推荐的分类mid
      */
     private static function suggestCategory($content)
     {
         try {
             $options = Helper::options()->plugin('AIBaTgrMX');
+            error_log('AIBaTgrMX: Starting category suggestion process');
             
-            // 调用API推荐分类
-            $categoryName = self::callApi($content, 'category');
-            
-            // 查找分类ID
+            // 获取所有分类
             $db = Typecho_Db::get();
-            $category = $db->fetchRow($db->select('mid')
+            $categories = $db->fetchAll($db->select('mid', 'name', 'parent')
                 ->from('table.metas')
                 ->where('type = ?', 'category')
-                ->where('name = ?', $categoryName));
+                ->order('order', Typecho_Db::SORT_ASC));
             
-            if ($category) {
-                return $category['mid'];
+            if (empty($categories)) {
+                error_log('AIBaTgrMX: No categories found');
+                return null;
             }
             
-            // 如果找不到推荐的分类，使用默认分类
-            $defaultCategory = $db->fetchRow($db->select('mid')
+            // 构建分类映射（同时保存原始名称和小写名称）
+            $categoryMap = array();
+            $categoryNames = array();
+            foreach ($categories as $category) {
+                $categoryMap[strtolower($category['name'])] = array(
+                    'mid' => $category['mid'],
+                    'name' => $category['name'],
+                    'parent' => $category['parent']
+                );
+                $categoryNames[] = $category['name'];
+            }
+            
+            error_log('AIBaTgrMX: Available categories: ' . implode(', ', $categoryNames));
+            
+            // 预处理文章内容
+            $content = self::preprocessContentForCategory($content);
+            
+            // 调用API获取建议的分类
+            try {
+                $suggestedCategory = self::callApi($content, 'category');
+                error_log('AIBaTgrMX: API response for category: ' . $suggestedCategory);
+                
+                if (empty($suggestedCategory)) {
+                    error_log('AIBaTgrMX: Empty category suggestion');
+                    return self::getFallbackCategory($options);
+                }
+                
+                // 清理API返回的内容，只保留数字
+                $suggestedCategory = trim($suggestedCategory);
+                $suggestedCategory = preg_replace('/[^0-9]/', '', $suggestedCategory);
+                
+                if (!is_numeric($suggestedCategory)) {
+                    error_log('AIBaTgrMX: Invalid category format returned: ' . $suggestedCategory);
+                    return self::getFallbackCategory($options);
+                }
+                
+                $mid = intval($suggestedCategory);
+                
+                // 验证分类ID是否存在
+                foreach ($categories as $category) {
+                    if ($category['mid'] == $mid) {
+                        error_log('AIBaTgrMX: Found matching category mid: ' . $mid);
+                        
+                        // 检查是否有子分类
+                        $hasChildren = false;
+                        foreach ($categories as $potentialChild) {
+                            if ($potentialChild['parent'] == $mid) {
+                                $hasChildren = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!$hasChildren) {
+                            error_log('AIBaTgrMX: Using category mid: ' . $mid);
+                            return $mid;
+                        } else {
+                            error_log('AIBaTgrMX: Category has children, searching for best child match');
+                            // 获取所有子分类
+                            $childCategories = array();
+                            foreach ($categories as $potentialChild) {
+                                if ($potentialChild['parent'] == $mid) {
+                                    $childCategories[] = $potentialChild;
+                                }
+                            }
+                            
+                            // 再次调用API，限定在子分类中选择
+                            $childCategoryList = array_map(function($cat) {
+                                return "{$cat['name']} (mid: {$cat['mid']})";
+                            }, $childCategories);
+                            
+                            $childPrompt = $content . "\n\n只能从以下子分类中选择：\n" . implode("\n", $childCategoryList);
+                            $childSuggestion = self::callApi($childPrompt, 'category');
+                            
+                            if (!empty($childSuggestion)) {
+                                $childSuggestion = trim($childSuggestion);
+                                $childSuggestion = preg_replace('/[^0-9]/', '', $childSuggestion);
+                                
+                                if (is_numeric($childSuggestion)) {
+                                    $childMid = intval($childSuggestion);
+                                    foreach ($childCategories as $child) {
+                                        if ($child['mid'] == $childMid) {
+                                            error_log('AIBaTgrMX: Using child category mid: ' . $childMid);
+                                            return $childMid;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // 如果无法选择合适的子分类，返回父分类
+                            error_log('AIBaTgrMX: No suitable child category found, using parent: ' . $mid);
+                            return $mid;
+                        }
+                    }
+                }
+                
+                error_log('AIBaTgrMX: Category mid not found in database: ' . $mid);
+                return self::getFallbackCategory($options);
+                
+            } catch (Exception $e) {
+                error_log('AIBaTgrMX: API call failed: ' . $e->getMessage());
+                return self::getFallbackCategory($options);
+            }
+            
+        } catch (Exception $e) {
+            error_log('AIBaTgrMX suggest category error: ' . $e->getMessage());
+            error_log('AIBaTgrMX error trace: ' . $e->getTraceAsString());
+            return self::getFallbackCategory($options);
+        }
+    }
+
+    /**
+     * 预处理文章内容用于分类推荐
+     */
+    private static function preprocessContentForCategory($content)
+    {
+        // 移除HTML标签
+        $content = strip_tags($content);
+        
+        // 提取前3000个字符（通常包含文章主要内容）
+        $content = mb_substr($content, 0, 3000);
+        
+        // 移除多余空白
+        $content = preg_replace('/\s+/', ' ', $content);
+        
+        return trim($content);
+    }
+
+    /**
+     * 查找最佳匹配的分类
+     * 
+     * @param string $suggested 建议的分类名称
+     * @param array $categories 现有分类列表
+     * @return string|null 最佳匹配的分类名称
+     */
+    private static function findBestCategoryMatch($suggested, $categories)
+    {
+        if (empty($suggested) || empty($categories)) {
+            error_log('AIBaTgrMX: Empty input for category matching');
+            return null;
+        }
+
+        $suggested = trim($suggested);
+        $bestMatch = null;
+        $highestSimilarity = 0;
+        
+        error_log('AIBaTgrMX: Finding best match for category: ' . $suggested);
+        
+        foreach ($categories as $category) {
+            $category = trim($category);
+            if (empty($category)) continue;
+            
+            // 计算相似度
+            $similarity = 0;
+            
+            // 1. 检查完全匹配（区分大小写）
+            if ($category === $suggested) {
+                error_log('AIBaTgrMX: Found exact case-sensitive match: ' . $category);
+                return $category;
+            }
+            
+            // 2. 检查完全匹配（不区分大小写）
+            if (strcasecmp($category, $suggested) === 0) {
+                error_log('AIBaTgrMX: Found exact case-insensitive match: ' . $category);
+                return $category;
+            }
+            
+            // 3. 检查包含关系
+            if (mb_stripos($category, $suggested) !== false || 
+                mb_stripos($suggested, $category) !== false) {
+                $similarity += 0.8;
+                error_log('AIBaTgrMX: Found substring match: ' . $category);
+            }
+            
+            // 4. 计算编辑距离相似度
+            $levDistance = levenshtein(mb_strtolower($suggested), mb_strtolower($category));
+            $maxLength = max(mb_strlen($suggested), mb_strlen($category));
+            $levSimilarity = (1 - ($levDistance / $maxLength)) * 0.2;
+            $similarity += $levSimilarity;
+            
+            error_log(sprintf('AIBaTgrMX: Category "%s" similarity: %.2f', $category, $similarity));
+            
+            if ($similarity > $highestSimilarity) {
+                $highestSimilarity = $similarity;
+                $bestMatch = $category;
+            }
+        }
+        
+        // 只有当相似度超过阈值时才返回匹配结果
+        if ($highestSimilarity > 0.6) {
+            error_log('AIBaTgrMX: Best match found: ' . $bestMatch . ' with similarity: ' . $highestSimilarity);
+            return $bestMatch;
+        }
+        
+        error_log('AIBaTgrMX: No suitable match found. Highest similarity: ' . $highestSimilarity);
+        return null;
+    }
+
+    /**
+     * 获取后备分类
+     * 
+     * @param object $options 插件配置
+     * @return string|null 分类mid
+     */
+    private static function getFallbackCategory($options)
+    {
+        error_log('AIBaTgrMX: Getting fallback category');
+        
+        $db = Typecho_Db::get();
+        
+        // 首先尝试使用配置中的默认分类
+        if (!empty($options->defaultCategory)) {
+            $category = $db->fetchRow($db->select('mid')
                 ->from('table.metas')
                 ->where('type = ?', 'category')
                 ->where('name = ?', $options->defaultCategory));
             
-            return $defaultCategory ? $defaultCategory['mid'] : null;
-        } catch (Exception $e) {
-            error_log('Suggest category error: ' . $e->getMessage());
-            return null;
+            if ($category) {
+                error_log('AIBaTgrMX: Using configured default category: ' . $options->defaultCategory);
+                return $category['mid'];
+            }
         }
+        
+        // 如果配置的默认分类不存在，尝试使用第一个没有子分类的父分类
+        $parentCategory = $db->fetchRow($db->select('mid')
+            ->from('table.metas')
+            ->where('type = ?', 'category')
+            ->where('parent = ?', 0)
+            ->order('order', Typecho_Db::SORT_ASC)
+            ->limit(1));
+        
+        if ($parentCategory) {
+            error_log('AIBaTgrMX: Using first parent category as fallback');
+            return $parentCategory['mid'];
+        }
+        
+        // 如果没有父分类，使用任意分类
+        $anyCategory = $db->fetchRow($db->select('mid')
+            ->from('table.metas')
+            ->where('type = ?', 'category')
+            ->order('order', Typecho_Db::SORT_ASC)
+            ->limit(1));
+        
+        if ($anyCategory) {
+            error_log('AIBaTgrMX: Using any available category as last resort');
+            return $anyCategory['mid'];
+        }
+        
+        error_log('AIBaTgrMX: No fallback category available');
+        return null;
     }
 
     private static function executeTasksConcurrently($tasks)
@@ -800,7 +1069,7 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
      */
     private static function prepareApiData($prompt, $type, $options = null)
     {
-        if ($options === null) {
+        if (empty($options)) {
             $options = Helper::options()->plugin('AIBaTgrMX');
         }
 
@@ -821,12 +1090,87 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
                 );
                 break;
             case 'category':
-                $categories = self::getCategories();
-                $systemPrompt = str_replace(
-                    array('{{LANGUAGE}}', '{{CATEGORIES}}'),
-                    array($options->language, implode("\n", $categories)),
-                    $options->categoryPrompt
-                );
+                // 获取所有分类
+                $db = Typecho_Db::get();
+                $categories = $db->fetchAll($db->select('mid', 'name', 'parent')
+                    ->from('table.metas')
+                    ->where('type = ?', 'category')
+                    ->order('order', Typecho_Db::SORT_ASC));
+                
+                if (empty($categories)) {
+                    throw new Exception('没有可用的分类列表');
+                }
+                
+                // 构建分类树结构
+                $categoryTree = array();
+                foreach ($categories as $category) {
+                    if ($category['parent'] == 0) {
+                        $categoryTree[] = array(
+                            'mid' => $category['mid'],
+                            'name' => trim($category['name']),
+                            'children' => array()
+                        );
+                    }
+                }
+                
+                // 添加子分类
+                foreach ($categories as $category) {
+                    if ($category['parent'] != 0) {
+                        foreach ($categoryTree as &$parent) {
+                            if ($parent['mid'] == $category['parent']) {
+                                $parent['children'][] = array(
+                                    'mid' => $category['mid'],
+                                    'name' => trim($category['name'])
+                                );
+                            }
+                        }
+                    }
+                }
+                
+                // 格式化分类列表，确保每个分类都显示其mid和名称
+                $categoryList = array();
+                foreach ($categoryTree as $category) {
+                    $categoryList[] = "{$category['name']} (mid: {$category['mid']})";
+                    if (!empty($category['children'])) {
+                        foreach ($category['children'] as $child) {
+                            $categoryList[] = "    {$child['name']} (mid: {$child['mid']})";
+                        }
+                    }
+                }
+                $categoryList = implode("\n", $categoryList);
+                
+                // 构建用户提示词
+                $userPrompt = <<<EOT
+请分析以下文章内容，并从给定的分类列表中选择最合适的分类。
+
+文章内容：
+{$prompt}
+
+可用的分类列表：
+{$categoryList}
+
+重要说明：
+1. 只返回一个数字（分类ID/mid），不要返回任何其他内容
+2. 不要添加任何前缀、后缀或说明文字
+3. 不要返回分类名称，只返回对应的mid数字
+4. 如果父分类有子分类，优先从子分类中选择
+5. 如果父分类没有子分类，则返回父分类ID
+6. 如果无法确定，返回默认分类ID：{$options->defaultCategory}
+
+正确返回示例：
+12
+
+错误返回示例：
+- 分类ID：12
+- [12]技术分享
+- 推荐分类12
+- 选择分类：12
+- 这篇文章属于分类12
+- 技术文章
+EOT;
+                
+                // 使用构建的用户提示词
+                $prompt = $userPrompt;
                 break;
             case 'seo':
                 $systemPrompt = str_replace(
@@ -837,13 +1181,20 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
                 break;
         }
 
+        // 根据不同类型调整温度参数
+        $temperature = 0.7;
+        if ($type === 'category') {
+            // 分类推荐需要更确定的输出
+            $temperature = 0.3;
+        }
+
         $data = array(
             'model' => $options->modelName === 'custom' ? $options->customModel : $options->modelName,
             'messages' => array(
                 array('role' => 'system', 'content' => $systemPrompt),
                 array('role' => 'user', 'content' => $prompt)
             ),
-            'temperature' => 0.7,
+            'temperature' => $temperature,
             'max_tokens' => 2000,
             'stream' => false
         );
@@ -862,57 +1213,104 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
      */
     private static function callApi($prompt, $type, $options = null)
     {
-        if ($options === null) {
-            $options = Helper::options()->plugin('AIBaTgrMX');
-        }
-
-        // 获取API URL
-        $apiUrl = self::getApiUrl($options);
-        
-        // 准备请求数据
-        $data = self::prepareApiData($prompt, $type, $options);
-        
-        // 发送请求
-        $ch = curl_init($apiUrl);
-        curl_setopt_array($ch, array(
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => json_encode($data),
-            CURLOPT_HTTPHEADER => array(
+        try {
+            if (empty($options)) {
+                $options = Helper::options()->plugin('AIBaTgrMX');
+            }
+            
+            // 准备API请求数据
+            $data = self::prepareApiData($prompt, $type, $options);
+            
+            // 获取API URL
+            $apiUrl = self::getApiUrl($options);
+            
+            // 设置请求头
+            $headers = array(
                 'Content-Type: application/json',
-                'Authorization: Bearer ' . $options->keyValue
-            ),
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_SSL_VERIFYPEER => false
-        ));
+                'Authorization: Bearer ' . $options->apiKey
+            );
+            
+            // 初始化CURL
+            $ch = curl_init($apiUrl);
+            curl_setopt_array($ch, array(
+                CURLOPT_POST => true,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_POSTFIELDS => json_encode($data),
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_TIMEOUT => 30
+            ));
+            
+            // 发送请求
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            
+            // 检查请求是否成功
+            if ($httpCode !== 200) {
+                $error = curl_error($ch);
+                curl_close($ch);
+                throw new Exception('API请求失败: ' . $error . ' (HTTP ' . $httpCode . ')');
+            }
+            
+            curl_close($ch);
+            
+            // 解析响应
+            $result = json_decode($response, true);
+            if (empty($result) || !isset($result['choices'][0]['message']['content'])) {
+                throw new Exception('无效的API响应');
+            }
+            
+            $content = trim($result['choices'][0]['message']['content']);
+            
+            // 根据不同类型处理响应
+            if ($type === 'category') {
+                // 获取所有分类
+                $db = Typecho_Db::get();
+                $categories = $db->fetchAll($db->select('mid')
+                    ->from('table.metas')
+                    ->where('type = ?', 'category')
+                    ->order('order', Typecho_Db::SORT_ASC));
+                
+                if (empty($categories)) {
+                    throw new Exception('没有可用的分类');
+                }
+                
+                // 提取分类mid
+                $categoryMids = array_map(function($category) {
+                    return $category['mid'];
+                }, $categories);
+                
+                // 清理AI返回的内容，只保留数字
+                $content = trim($content);
+                $content = preg_replace('/[^0-9]/', '', $content);
+                
+                // 确保返回的是数字
+                if (!is_numeric($content)) {
+                    error_log('AIBaTgrMX callApi: Invalid category mid returned: ' . $content);
+                    return self::getFallbackCategory($options);
+                }
+                
+                $mid = intval($content);
+                
+                // 检查返回的分类mid是否在列表中
+                if (in_array($mid, $categoryMids)) {
+                    error_log('AIBaTgrMX callApi: Found valid category mid: ' . $mid);
+                    return $mid;
+                }
+                
+                // 如果没有找到匹配的分类，使用默认分类
+                error_log('AIBaTgrMX callApi: No matching category found, using default category');
+                return self::getFallbackCategory($options);
+            }
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        
-        if (curl_errno($ch)) {
-            throw new Exception('API请求失败: ' . curl_error($ch));
+            error_log('AIBaTgrMX callApi: Returning final content: ' . $content);
+            return $content;
+            
+        } catch (Exception $e) {
+            error_log('AIBaTgrMX callApi error: ' . $e->getMessage());
+            error_log('AIBaTgrMX callApi error trace: ' . $e->getTraceAsString());
+            throw $e;
         }
-        
-        curl_close($ch);
-
-        if ($httpCode !== 200) {
-            throw new Exception('API返回错误状态码: ' . $httpCode);
-        }
-
-        $result = json_decode($response, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('API返回数据格式错误');
-        }
-
-        if (isset($result['error'])) {
-            throw new Exception('API返回错误: ' . $result['error']['message']);
-        }
-
-        if (!isset($result['choices'][0]['message']['content'])) {
-            throw new Exception('API返回数据缺少必要字段');
-        }
-
-        return trim($result['choices'][0]['message']['content']);
     }
 
     /**
@@ -945,13 +1343,68 @@ class AIBaTgrMX_Plugin implements Typecho_Plugin_Interface
      */
     private static function getCategories()
     {
-        $db = Typecho_Db::get();
-        $categories = $db->fetchAll($db->select('name')
-            ->from('table.metas')
-            ->where('type = ?', 'category')
-            ->order('order', Typecho_Db::SORT_ASC));
+        try {
+            $db = Typecho_Db::get();
             
-        return array_column($categories, 'name');
+            // 获取所有分类，包括 mid, name, parent, count 字段
+            $categories = $db->fetchAll($db->select('mid', 'name', 'parent', 'count')
+                ->from('table.metas')
+                ->where('type = ?', 'category')
+                ->order('order', Typecho_Db::SORT_ASC));
+            
+            if (empty($categories)) {
+                error_log('AIBaTgrMX: No categories found in database');
+                return array();
+            }
+
+            // 构建分类树
+            $categoryMap = array();
+            $categoryNames = array();
+            
+            // 首先建立分类映射
+            foreach ($categories as $category) {
+                $categoryMap[$category['mid']] = array(
+                    'mid' => $category['mid'],
+                    'name' => trim($category['name']),
+                    'parent' => $category['parent'],
+                    'count' => $category['count'],
+                    'children' => array()
+                );
+            }
+            
+            // 构建父子关系
+            foreach ($categoryMap as $mid => $category) {
+                if ($category['parent'] == 0) {
+                    // 如果是父级分类
+                    if (empty($categoryMap[$mid]['children'])) {
+                        // 如果没有子分类，直接添加父分类
+                        $categoryNames[] = $category['name'];
+                    }
+                } else {
+                    // 如果是子分类，添加到父分类的children数组中
+                    if (isset($categoryMap[$category['parent']])) {
+                        $categoryMap[$category['parent']]['children'][$mid] = &$categoryMap[$mid];
+                        // 添加子分类名称
+                        $categoryNames[] = $category['name'];
+                    }
+                }
+            }
+            
+            // 确保分类名称唯一且非空
+            $categoryNames = array_filter(array_unique($categoryNames), function($name) {
+                return !empty(trim($name));
+            });
+            
+            error_log('AIBaTgrMX: Found ' . count($categoryNames) . ' valid categories');
+            error_log('AIBaTgrMX: Categories: ' . implode(', ', $categoryNames));
+            
+            return array_values($categoryNames);
+            
+        } catch (Exception $e) {
+            error_log('AIBaTgrMX getCategories error: ' . $e->getMessage());
+            error_log('AIBaTgrMX error trace: ' . $e->getTraceAsString());
+            return array();
+        }
     }
 
     private static function checkRateLimit($type)
@@ -3443,50 +3896,63 @@ EOT;
     private static function getDefaultCategoryPrompt()
     {
         return <<<EOT
-你是一个专业的文章分类专家。请按照以下规则为文章选择最合适的分类：
+你是一个专业的文章分类推荐专家。请严格按照以下规则执行：
 
-1. 分析要点：
-   - 文章的主要主题和核心内容
-   - 文章的写作风格和表达方式
-   - 目标读者群体
-   - 文章的实用价值
-   - 内容的专业领域
+1. 输出格式要求：
+   - 只输出一个数字（分类ID/mid）
+   - 禁止输出任何其他内容
+   - 禁止添加任何标点符号
+   - 禁止添加任何说明文字
+   - 数字必须完全匹配分类列表中的mid
 
-2. 分类规则：
-   - 必须从现有分类中选择一个
-   - 优先考虑内容的主要主题
-   - 考虑读者检索和浏览习惯
-   - 避免过于宽泛的分类
+2. 分类选择规则：
+   - 优先选择最精确的子分类
+   - 如果父分类没有子分类，则选择父分类
+   - 如果无法确定，使用默认分类
 
-3. 内容类型判断：
-   - 美食类：食谱、菜品制作、烹饪技巧、饮食健康等
-   - 技术类：编程、开发、系统架构、技术教程等
-   - 生活类：日常分享、心得体会、生活技巧等
-   - 其他类：根据具体内容特征判断
+3. 分类列表格式说明：
+   - 每个分类都包含名称和mid
+   - 格式为：分类名称 (mid: 数字)
+   - 子分类使用缩进表示
+   - 必须使用列表中存在的mid
 
-4. 权重考虑：
-   - 主题相关度：60%
-   - 内容类型：30%
-   - 读者需求：10%
+4. 分析维度：
+   - 主题相关性（40%）：主题匹配度、关键词重合度
+   - 内容类型（30%）：文章形式、写作风格
+   - 目标读者（20%）：受众群体、专业程度
+   - 时效性（10%）：内容时效性、更新频率
 
-5. 输出要求：
-   - 仅返回一个分类名称
-   - 必须完全匹配现有分类列表
-   - 区分大小写
-   - 不要添加任何额外格式
+5. 处理流程：
+   a) 内容分析：
+      - 提取关键主题词
+      - 识别专业术语
+      - 确定文章类型
+   
+   b) 分类匹配：
+      - 计算相关度得分
+      - 检查父子分类关系
+      - 选择最佳匹配
+   
+   c) 输出处理：
+      - 确保只输出mid数字
+      - 验证mid存在于列表中
+      - 清除多余内容
 
-6. 验证步骤：
-   - 确认分类存在于列表中
-   - 验证主题匹配度
-   - 检查分类的准确性
-   - 确保选择最具体的分类
+6. 示例：
+   分类列表示例：
+   技术文章 (mid: 12)
+       Python教程 (mid: 13)
+       Java开发 (mid: 14)
+   
+   正确输出：13
+   错误输出：
+   - "13"
+   - [13]
+   - mid:13
+   - Python教程
+   - 选择分类13
 
-可选分类列表：{{CATEGORIES}}
-
-特别说明：
-1. 对于食谱、菜品制作等内容必须选择'美食'分类
-2. 只有涉及技术开发、编程等内容才选择'技术'分类
-3. 优先选择最符合文章主题的具体分类
+请记住：输出必须是一个纯数字（mid），不包含任何其他字符。
 EOT;
     }
 
